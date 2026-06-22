@@ -17,6 +17,7 @@ use gpui_component::{
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(800);
+const AUTO_QUIT_DELAY: Duration = Duration::from_secs(10);
 const WINDOW_WIDTH: f32 = 390.0;
 
 #[derive(Clone)]
@@ -32,6 +33,8 @@ struct PvctlApp {
     sinks: Vec<AudioSink>,
     slider_bounds: HashMap<String, Bounds<Pixels>>,
     selected_sink_name: Option<String>,
+    auto_quit_armed: bool,
+    auto_quit_generation: u64,
 }
 
 impl PvctlApp {
@@ -40,6 +43,8 @@ impl PvctlApp {
             sinks: Vec::new(),
             slider_bounds: HashMap::new(),
             selected_sink_name: None,
+            auto_quit_armed: false,
+            auto_quit_generation: 0,
         };
 
         if let Ok(state) = audio::load_state() {
@@ -121,7 +126,29 @@ impl PvctlApp {
         };
 
         self.selected_sink_name = Some(self.sinks[next].name.clone());
+        self.record_user_operation(false, cx);
         cx.notify();
+    }
+
+    fn record_user_operation(&mut self, start_auto_quit: bool, cx: &mut Context<Self>) {
+        if !start_auto_quit && !self.auto_quit_armed {
+            return;
+        }
+
+        self.auto_quit_armed = true;
+        self.auto_quit_generation = self.auto_quit_generation.wrapping_add(1);
+        let generation = self.auto_quit_generation;
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(AUTO_QUIT_DELAY).await;
+
+            let _ = this.update(cx, move |this, cx| {
+                if this.auto_quit_armed && this.auto_quit_generation == generation {
+                    cx.quit();
+                }
+            });
+        })
+        .detach();
     }
 
     fn refresh_once(&mut self, cx: &mut Context<Self>) {
@@ -146,6 +173,7 @@ impl PvctlApp {
             sink.volume_percent = percent as f32;
             sink.muted = false;
         }
+        self.record_user_operation(true, cx);
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -174,6 +202,7 @@ impl PvctlApp {
             }
         }
         self.selected_sink_name = Some(sink_name.clone());
+        self.record_user_operation(should_lower_volume, cx);
 
         cx.notify();
 
