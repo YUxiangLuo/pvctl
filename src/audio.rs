@@ -15,6 +15,7 @@ pub struct AudioSink {
     pub index: u32,
     pub name: String,
     pub description: String,
+    pub state: String,
     pub muted: bool,
     pub volume_percent: f32,
     pub is_default: bool,
@@ -30,6 +31,7 @@ struct PactlSink {
     index: u32,
     name: String,
     description: Option<String>,
+    state: Option<String>,
     mute: bool,
     volume: HashMap<String, PactlVolume>,
 }
@@ -83,6 +85,7 @@ fn load_sinks() -> Result<Vec<AudioSink>> {
             description: sink
                 .description
                 .unwrap_or_else(|| "Unknown sink".to_string()),
+            state: sink.state.unwrap_or_else(|| "UNKNOWN".to_string()),
             muted: sink.mute,
             volume_percent: volume_percent(&sink.volume),
             is_default: false,

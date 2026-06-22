@@ -293,6 +293,12 @@ impl PvctlApp {
     fn render_sink(&self, sink: &AudioSink, cx: &mut Context<Self>) -> AnyElement {
         let volume = sink.volume_percent.round() as u32;
         let default_name = sink.name.clone();
+        let status_label = sink_status_label(&sink.state);
+        let status_color = if sink.state == "RUNNING" {
+            cx.theme().green
+        } else {
+            cx.theme().muted_foreground
+        };
         let volume_color = if sink.muted {
             cx.theme().muted_foreground
         } else {
@@ -334,6 +340,17 @@ impl PvctlApp {
                                     .font_semibold()
                                     .truncate()
                                     .child(short_name(&sink.description)),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .bg(status_color.opacity(0.12))
+                                    .text_color(status_color)
+                                    .child(status_label),
                             )
                             .children(sink.is_default.then(|| {
                                 div()
@@ -425,6 +442,17 @@ impl Render for PvctlApp {
 
 fn desired_window_size() -> gpui::Size<gpui::Pixels> {
     size(px(WINDOW_WIDTH), px(102.0))
+}
+
+fn sink_status_label(state: &str) -> SharedString {
+    match state {
+        "RUNNING" => "正在工作",
+        "IDLE" => "空闲",
+        "SUSPENDED" => "待机",
+        "UNKNOWN" => "未知",
+        other => other,
+    }
+    .into()
 }
 
 fn short_name(description: &str) -> SharedString {
