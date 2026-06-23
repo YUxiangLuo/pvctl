@@ -63,6 +63,7 @@ impl PvctlApp {
             app.apply_audio_state(state);
         }
         app.start_refresh_loop(cx);
+        app.record_user_operation(true, cx);
         app
     }
 
