@@ -18,6 +18,7 @@ use gpui_component::{
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(800);
 const AUTO_QUIT_DELAY: Duration = Duration::from_secs(10);
+const VOLUME_COMMIT_DELAY: Duration = Duration::from_millis(75);
 const WINDOW_WIDTH: f32 = 390.0;
 
 #[derive(Clone)]
@@ -29,9 +30,18 @@ impl Render for VolumeDrag {
     }
 }
 
+struct VolumeCommit {
+    percent: u32,
+    generation: u64,
+    timer_armed: bool,
+    in_flight: bool,
+}
+
 struct PvctlApp {
     sinks: Vec<AudioSink>,
     slider_bounds: HashMap<String, Bounds<Pixels>>,
+    volume_commits: HashMap<String, VolumeCommit>,
+    volume_commit_generation: u64,
     selected_sink_name: Option<String>,
     auto_quit_armed: bool,
     auto_quit_generation: u64,
@@ -42,6 +52,8 @@ impl PvctlApp {
         let mut app = Self {
             sinks: Vec::new(),
             slider_bounds: HashMap::new(),
+            volume_commits: HashMap::new(),
+            volume_commit_generation: 0,
             selected_sink_name: None,
             auto_quit_armed: false,
             auto_quit_generation: 0,
@@ -76,10 +88,20 @@ impl PvctlApp {
     }
 
     fn apply_audio_state(&mut self, state: AudioState) {
-        self.slider_bounds
-            .retain(|name, _| state.sinks.iter().any(|sink| &sink.name == name));
-
         let mut sinks = state.sinks;
+
+        self.slider_bounds
+            .retain(|name, _| sinks.iter().any(|sink| &sink.name == name));
+        self.volume_commits
+            .retain(|name, _| sinks.iter().any(|sink| &sink.name == name));
+
+        for sink in &mut sinks {
+            if let Some(commit) = self.volume_commits.get(&sink.name) {
+                sink.volume_percent = commit.percent as f32;
+                sink.muted = false;
+            }
+        }
+
         sinks.sort_by(|a, b| {
             b.is_default
                 .cmp(&a.is_default)
@@ -166,6 +188,107 @@ impl PvctlApp {
         .detach();
     }
 
+    fn queue_sink_volume_commit(
+        &mut self,
+        sink_name: String,
+        percent: u32,
+        cx: &mut Context<Self>,
+    ) {
+        self.volume_commit_generation = self.volume_commit_generation.wrapping_add(1);
+        let generation = self.volume_commit_generation;
+
+        let should_spawn_timer = {
+            let entry = self
+                .volume_commits
+                .entry(sink_name.clone())
+                .or_insert(VolumeCommit {
+                    percent,
+                    generation,
+                    timer_armed: false,
+                    in_flight: false,
+                });
+            entry.percent = percent;
+            entry.generation = generation;
+
+            if entry.timer_armed || entry.in_flight {
+                false
+            } else {
+                entry.timer_armed = true;
+                true
+            }
+        };
+
+        if should_spawn_timer {
+            self.spawn_volume_commit_timer(sink_name, cx);
+        }
+    }
+
+    fn spawn_volume_commit_timer(&self, sink_name: String, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(VOLUME_COMMIT_DELAY).await;
+
+            let commit = this.update(cx, |this, _| {
+                let entry = this.volume_commits.get_mut(&sink_name)?;
+                entry.timer_armed = false;
+                if entry.in_flight {
+                    return None;
+                }
+
+                entry.in_flight = true;
+                Some((entry.percent, entry.generation))
+            });
+
+            let Ok(Some((percent, generation))) = commit else {
+                return;
+            };
+
+            let sink_name_for_command = sink_name.clone();
+            let result = cx
+                .background_spawn(
+                    async move { audio::set_sink_volume(&sink_name_for_command, percent) },
+                )
+                .await;
+            let failed = result.is_err();
+
+            let _ = this.update(cx, move |this, cx| {
+                let mut should_spawn_timer = false;
+                let mut should_refresh = false;
+
+                match this
+                    .volume_commits
+                    .get(&sink_name)
+                    .map(|entry| entry.generation)
+                {
+                    Some(latest_generation) if latest_generation == generation => {
+                        this.volume_commits.remove(&sink_name);
+                        should_refresh = failed;
+                    }
+                    Some(_) => {
+                        if let Some(entry) = this.volume_commits.get_mut(&sink_name) {
+                            entry.in_flight = false;
+                            if !entry.timer_armed {
+                                entry.timer_armed = true;
+                                should_spawn_timer = true;
+                            }
+                        }
+                    }
+                    None => {}
+                }
+
+                if should_spawn_timer {
+                    this.spawn_volume_commit_timer(sink_name.clone(), cx);
+                }
+
+                if should_refresh {
+                    this.refresh_once(cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn set_sink_volume(&mut self, sink_name: String, value: f32, cx: &mut Context<Self>) {
         let percent = value.round().clamp(0.0, 100.0) as u32;
 
@@ -175,17 +298,7 @@ impl PvctlApp {
         }
         self.record_user_operation(true, cx);
         cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { audio::set_sink_volume(&sink_name, percent) })
-                .await;
-
-            if result.is_err() {
-                let _ = this.update(cx, |_, cx| cx.notify());
-            }
-        })
-        .detach();
+        self.queue_sink_volume_commit(sink_name, percent, cx);
     }
 
     fn set_default_sink(&mut self, sink_name: String, cx: &mut Context<Self>) {
@@ -203,17 +316,15 @@ impl PvctlApp {
         }
         self.selected_sink_name = Some(sink_name.clone());
         self.record_user_operation(should_lower_volume, cx);
+        if should_lower_volume {
+            self.queue_sink_volume_commit(sink_name.clone(), 30, cx);
+        }
 
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move {
-                    if should_lower_volume {
-                        audio::set_sink_volume(&sink_name, 30)?;
-                    }
-                    audio::set_default_sink(&sink_name)
-                })
+                .background_spawn(async move { audio::set_default_sink(&sink_name) })
                 .await;
 
             let _ = this.update(cx, |this, cx| {
