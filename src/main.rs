@@ -43,7 +43,6 @@ struct PvctlApp {
     volume_commits: HashMap<String, VolumeCommit>,
     volume_commit_generation: u64,
     selected_sink_name: Option<String>,
-    auto_quit_armed: bool,
     auto_quit_generation: u64,
 }
 
@@ -55,7 +54,6 @@ impl PvctlApp {
             volume_commits: HashMap::new(),
             volume_commit_generation: 0,
             selected_sink_name: None,
-            auto_quit_armed: false,
             auto_quit_generation: 0,
         };
 
@@ -63,7 +61,7 @@ impl PvctlApp {
             app.apply_audio_state(state);
         }
         app.start_refresh_loop(cx);
-        app.record_user_operation(true, cx);
+        app.reset_auto_quit_timer(cx);
         app
     }
 
@@ -149,16 +147,11 @@ impl PvctlApp {
         };
 
         self.selected_sink_name = Some(self.sinks[next].name.clone());
-        self.record_user_operation(false, cx);
+        self.reset_auto_quit_timer(cx);
         cx.notify();
     }
 
-    fn record_user_operation(&mut self, start_auto_quit: bool, cx: &mut Context<Self>) {
-        if !start_auto_quit && !self.auto_quit_armed {
-            return;
-        }
-
-        self.auto_quit_armed = true;
+    fn reset_auto_quit_timer(&mut self, cx: &mut Context<Self>) {
         self.auto_quit_generation = self.auto_quit_generation.wrapping_add(1);
         let generation = self.auto_quit_generation;
 
@@ -166,7 +159,7 @@ impl PvctlApp {
             cx.background_executor().timer(AUTO_QUIT_DELAY).await;
 
             let _ = this.update(cx, move |this, cx| {
-                if this.auto_quit_armed && this.auto_quit_generation == generation {
+                if this.auto_quit_generation == generation {
                     cx.quit();
                 }
             });
@@ -297,7 +290,7 @@ impl PvctlApp {
             sink.volume_percent = percent as f32;
             sink.muted = false;
         }
-        self.record_user_operation(true, cx);
+        self.reset_auto_quit_timer(cx);
         cx.notify();
         self.queue_sink_volume_commit(sink_name, percent, cx);
     }
@@ -316,7 +309,7 @@ impl PvctlApp {
             }
         }
         self.selected_sink_name = Some(sink_name.clone());
-        self.record_user_operation(should_lower_volume, cx);
+        self.reset_auto_quit_timer(cx);
         if should_lower_volume {
             self.queue_sink_volume_commit(sink_name.clone(), 30, cx);
         }
